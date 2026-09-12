@@ -1,6 +1,5 @@
 # 🛡️ [Project Name]
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Live%20OS-lightgrey)]()
 [![Status](https://img.shields.io/badge/status-Development-orange)]()
@@ -41,3 +40,9 @@ Pre-configured with 50+ security tools:
 - **Exploit** — Authorized exploitation with pre-checks
 
 ---
+
+## License
+Copyright © 2026 [Dipesh Fuse]. All rights reserved. 
+This software and its source code are proprietary. Unauthorized copying, 
+modification, or distribution is strictly prohibited.
+
