@@ -1,0 +1,4 @@
+{
+  "ollama_endpoint": "http://localhost:11434",
+  "ollama_model": "hf.co/llmfan46/gemma-4-E4B-it-ultra-uncensored-heretic-GGUF:Q5_K_M"
+}
