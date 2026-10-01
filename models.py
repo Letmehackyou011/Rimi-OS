@@ -13,6 +13,7 @@ Base = declarative_base()
 class ScanStatusEnum(str, enum.Enum):
     """Scan status enumeration"""
     PENDING = "pending"
+    AWAITING_REVIEW = "awaiting_review"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"

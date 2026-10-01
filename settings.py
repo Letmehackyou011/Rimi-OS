@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     
     # Ollama Configuration
     OLLAMA_ENDPOINT: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "mistral"
+    OLLAMA_MODEL: str = "hf.co/llmfan46/gemma-4-E4B-it-ultra-uncensored-heretic-GGUF:Q5_K_M"
+    RUNTIME_CONFIG_PATH: str = "./runtime-config.json"
     
     # Claude Configuration
     CLAUDE_API_KEY: str = ""

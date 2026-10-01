@@ -9,10 +9,11 @@ from typing import Dict, Any, TypedDict, List
 from datetime import datetime
 
 from langgraph.graph import StateGraph
-from langchain_core.messages import BaseMessage, HumanMessage
-
 from utils.llm_client import get_llm_client
 from database.models import Scan, Vulnerability, Report, SeverityEnum
+from security.events import is_scan_cancelled, publish_scan_event
+from security.scope import ScopeDocument, ScopeTarget
+from security.tool_runner import run_reconnaissance
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class ScanState(TypedDict):
     
     # Reconnaissance results
     reconnaissance_results: Dict[str, Any]
+    tool_results: List[Dict[str, Any]]
     discovered_vulnerabilities: List[Dict[str, Any]]
     
     # Exploitation results
@@ -48,8 +50,15 @@ class SecurityAgentOrchestrator:
     
     def __init__(self, db_session=None):
         self.db_session = db_session
-        self.llm_client = get_llm_client()
+        self._llm_clients = {}
         self.graph = self._build_graph()
+
+    def _client_for_state(self, state: ScanState):
+        """Resolve and cache the LangChain model selected for this scan."""
+        key = (state["llm_provider"], state["llm_model"])
+        if key not in self._llm_clients:
+            self._llm_clients[key] = get_llm_client(*key)
+        return self._llm_clients[key]
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow"""
@@ -80,13 +89,21 @@ class SecurityAgentOrchestrator:
         """
         logger.info(f"🔍 Starting reconnaissance on {state['target']}")
         state['stage'] = 'reconnaissance'
+        await self._persist_progress(state['scan_id'], 'reconnaissance', 10.0)
+        if is_scan_cancelled(state['scan_id']):
+            state['status'] = 'cancelled'
+            return state
+        publish_scan_event(state['scan_id'], "stage_started", stage="reconnaissance")
         
         try:
+            scope_document = ScopeDocument.model_validate_json(state['scope'])
+            tool_results = await run_reconnaissance(scope_document, state['scan_id'])
+            state['tool_results'] = tool_results
             # Build reconnaissance prompt
-            prompt = self._build_recon_prompt(state)
+            prompt = self._build_recon_prompt(state, tool_results)
             
             # Get LLM response
-            response = await self.llm_client.generate(prompt)
+            response = await self._client_for_state(state).generate(prompt)
             
             # Parse findings
             findings = self._parse_findings(response)
@@ -98,13 +115,21 @@ class SecurityAgentOrchestrator:
             }
             
             state['discovered_vulnerabilities'] = findings.get('vulnerabilities', [])
+            await self._persist_progress(state['scan_id'], 'reconnaissance', 35.0)
             
             logger.info(f"✅ Reconnaissance complete: {len(state['discovered_vulnerabilities'])} vulnerabilities found")
+            publish_scan_event(
+                state['scan_id'],
+                "stage_finished",
+                stage="reconnaissance",
+                vulnerabilities=len(state['discovered_vulnerabilities']),
+            )
             
         except Exception as e:
             logger.error(f"❌ Reconnaissance failed: {str(e)}")
             state['error'] = f"Reconnaissance error: {str(e)}"
             state['status'] = "failed"
+            publish_scan_event(state['scan_id'], "stage_failed", stage="reconnaissance", error=str(e))
         
         return state
     
@@ -116,6 +141,11 @@ class SecurityAgentOrchestrator:
         """
         logger.info("⚔️ Starting exploitation verification")
         state['stage'] = 'exploitation'
+        await self._persist_progress(state['scan_id'], 'validation', 45.0)
+        if is_scan_cancelled(state['scan_id']):
+            state['status'] = 'cancelled'
+            return state
+        publish_scan_event(state['scan_id'], "stage_started", stage="verification")
         
         try:
             if not state['discovered_vulnerabilities']:
@@ -128,10 +158,13 @@ class SecurityAgentOrchestrator:
             
             # Test each vulnerability
             for vuln in state['discovered_vulnerabilities'][:5]:  # Limit to 5 for demo
+                if is_scan_cancelled(state['scan_id']):
+                    state['status'] = 'cancelled'
+                    return state
                 prompt = self._build_exploitation_prompt(state, vuln)
                 
                 try:
-                    response = await self.llm_client.generate(prompt)
+                    response = await self._client_for_state(state).generate(prompt)
                     verification = self._parse_verification(response)
                     
                     if verification.get('verified', False):
@@ -150,8 +183,10 @@ class SecurityAgentOrchestrator:
             }
             
             state['verified_vulnerabilities'] = verified
+            await self._persist_progress(state['scan_id'], 'validation', 65.0)
             
             logger.info(f"✅ Exploitation complete: {len(verified)} verified")
+            publish_scan_event(state['scan_id'], "stage_finished", stage="verification", verified=len(verified))
             
         except Exception as e:
             logger.error(f"❌ Exploitation failed: {str(e)}")
@@ -167,21 +202,28 @@ class SecurityAgentOrchestrator:
         """
         logger.info("📄 Generating security report")
         state['stage'] = 'reporting'
+        await self._persist_progress(state['scan_id'], 'reporting', 80.0)
+        if is_scan_cancelled(state['scan_id']):
+            state['status'] = 'cancelled'
+            return state
+        publish_scan_event(state['scan_id'], "stage_started", stage="reporting")
         
         try:
             # Build report prompt
             prompt = self._build_report_prompt(state)
             
             # Generate report
-            response = await self.llm_client.generate(prompt)
+            response = await self._client_for_state(state).generate(prompt)
             
             report_data = self._parse_report(response, state)
             
             state['report_findings'] = report_data
             state['report_path'] = f"reports/{state['scan_id']}.pdf"
             state['status'] = "completed"
+            await self._persist_progress(state['scan_id'], 'completed', 100.0)
             
             logger.info(f"✅ Report generated successfully")
+            publish_scan_event(state['scan_id'], "stage_finished", stage="reporting")
             
         except Exception as e:
             logger.error(f"❌ Report generation failed: {str(e)}")
@@ -189,8 +231,25 @@ class SecurityAgentOrchestrator:
             state['status'] = "failed"
         
         return state
+
+    async def _persist_progress(self, scan_id: str, stage: str, progress: float) -> None:
+        """Persist stage checkpoints so clients see real execution progress."""
+        try:
+            from sqlalchemy import update
+            from database.db import AsyncSessionLocal
+            from database.models import Scan
+
+            async with AsyncSessionLocal() as session:
+                await session.execute(update(Scan).where(Scan.id == scan_id).values(
+                    current_stage=stage,
+                    progress_percentage=progress,
+                ))
+                await session.commit()
+        except Exception:
+            logger.warning("Could not persist progress for scan %s", scan_id, exc_info=True)
+        publish_scan_event(scan_id, 'progress', stage=stage, progress=progress)
     
-    def _build_recon_prompt(self, state: ScanState) -> str:
+    def _build_recon_prompt(self, state: ScanState, tool_results: List[Dict[str, Any]]) -> str:
         """Build reconnaissance prompt"""
         return f"""
         You are a security researcher. Perform reconnaissance on the following target:
@@ -199,7 +258,10 @@ class SecurityAgentOrchestrator:
         Scope: {state['scope']}
         Mode: {state['mode']}
         
-        Identify potential vulnerabilities and security issues. 
+        Analyze only the supplied reconnaissance evidence. Do not invent services or claim exploitation.
+        Identify potential vulnerabilities and security issues.
+        Tool evidence:
+        {json.dumps(tool_results, indent=2)}
         Return a JSON response with:
         {{
             "summary": "brief summary",
@@ -218,7 +280,8 @@ class SecurityAgentOrchestrator:
     def _build_exploitation_prompt(self, state: ScanState, vuln: Dict) -> str:
         """Build exploitation verification prompt"""
         return f"""
-        Verify if this vulnerability can be exploited:
+        Verification task: assess whether this finding is supported by the collected evidence. Do not execute exploitation,
+        credential attacks, payloads, persistence, or proof-of-concept commands:
         
         Target: {state['target']}
         Vulnerability: {vuln.get('title')}
@@ -307,7 +370,11 @@ class SecurityAgentOrchestrator:
     async def execute_scan(self, scan_id: str, target: str, scope: str, mode: str, 
                           llm_provider: str, llm_model: str) -> ScanState:
         """Execute complete scan workflow"""
-        
+        if not scope:
+            scope = ScopeDocument(
+                targets=[ScopeTarget(host=target)],
+            ).model_dump_json()
+
         initial_state: ScanState = {
             "scan_id": scan_id,
             "target": target,
@@ -317,6 +384,7 @@ class SecurityAgentOrchestrator:
             "llm_provider": llm_provider,
             "llm_model": llm_model,
             "reconnaissance_results": {},
+            "tool_results": [],
             "discovered_vulnerabilities": [],
             "exploitation_results": {},
             "verified_vulnerabilities": [],

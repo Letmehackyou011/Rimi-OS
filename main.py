@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from config.settings import settings
 from database.db import init_db, get_db
-from routes import scan, config as config_routes, reports
+from routes import scan, config as config_routes, reports, capabilities
 
 # Configure logging
 logging.basicConfig(
@@ -73,6 +73,7 @@ async def root():
 app.include_router(scan.router, prefix="/api/scan", tags=["Scanning"])
 app.include_router(config_routes.router, prefix="/api/config", tags=["Configuration"])
 app.include_router(reports.router, prefix="/api/reports", tags=["Reports"])
+app.include_router(capabilities.router, prefix="/api/capabilities", tags=["Capabilities"])
 
 # Error Handlers
 @app.exception_handler(Exception)

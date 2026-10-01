@@ -4,24 +4,31 @@ Scanning Routes - Handle scan operations
 
 import logging
 import uuid
+import json
+import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.db import get_db
-from database.models import Scan, ScanStatusEnum
+from database.db import AsyncSessionLocal, get_db
+from database.models import Scan, ScanStatusEnum, Vulnerability
 from agents.orchestrator import get_orchestrator
 from config.settings import settings
+from security.events import get_scan_events, mark_scan_cancelled, publish_scan_event
+from security.scope import ScopeDocument, SecurityMode, scope_from_request
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_cancelled_scans: set[str] = set()
+_scheduled_scans: dict[str, dict] = {}
 
 class ScanRequest(BaseModel):
     """Scan request model"""
     target: str
-    scope: Optional[str] = None
-    mode: str = "normal"  # "normal", "aggressive", "stealth"
+    scope: ScopeDocument | str | None = None
+    mode: SecurityMode = SecurityMode.SAFE
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
 
@@ -52,6 +59,14 @@ class ScanResultsResponse(BaseModel):
     recommendations: list
     risk_score: float
 
+
+class ApprovalRequest(BaseModel):
+    approval_token: str
+
+
+class ScheduleRequest(BaseModel):
+    run_at: datetime
+
 @router.post("/start", response_model=ScanResponse)
 async def start_scan(
     request: ScanRequest,
@@ -77,17 +92,23 @@ async def start_scan(
         if not request.target:
             raise HTTPException(status_code=400, detail="Target cannot be empty")
         
+        try:
+            scope_document = scope_from_request(request.target, request.scope, request.mode.value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid authorization scope: {exc}") from exc
+
         # Use default LLM settings if not provided
         llm_provider = request.llm_provider or settings.ACTIVE_LLM
         llm_model = request.llm_model or settings.OLLAMA_MODEL
+        awaiting_review = scope_document.mode == SecurityMode.HUMAN_REVIEW and not scope_document.approval_token
         
         # Create scan record
         scan = Scan(
             id=scan_id,
             target=request.target,
-            scope=request.scope or "",
-            mode=request.mode,
-            status=ScanStatusEnum.PENDING,
+            scope=scope_document.model_dump_json(),
+            mode=scope_document.mode.value,
+            status=ScanStatusEnum.AWAITING_REVIEW if awaiting_review else ScanStatusEnum.PENDING,
             llm_provider=llm_provider,
             llm_model=llm_model,
             progress_percentage=0.0,
@@ -99,24 +120,25 @@ async def start_scan(
         
         logger.info(f"📌 Scan {scan_id} created for {request.target}")
         
-        # Add background task to execute scan
-        background_tasks.add_task(
-            _execute_scan_background,
-            scan_id=scan_id,
-            target=request.target,
-            scope=request.scope or "",
-            mode=request.mode,
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            db_session=db
-        )
+        if awaiting_review:
+            publish_scan_event(scan_id, "awaiting_human_review", target=request.target)
+        else:
+            background_tasks.add_task(
+                _execute_scan_background,
+                scan_id=scan_id,
+                target=request.target,
+                scope=scope_document.model_dump_json(),
+                mode=scope_document.mode.value,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
+            )
         
         return ScanResponse(
             scan_id=scan_id,
             target=request.target,
             status="pending",
             created_at=scan.created_at.isoformat(),
-            message="Scan queued and will start shortly"
+            message="Scan is awaiting human approval" if awaiting_review else "Scan queued and will start shortly"
         )
     
     except HTTPException:
@@ -232,6 +254,8 @@ async def cancel_scan(
         if scan.status in [ScanStatusEnum.COMPLETED, ScanStatusEnum.FAILED]:
             raise HTTPException(status_code=400, detail="Cannot cancel completed scan")
         
+        mark_scan_cancelled(scan_id)
+        _cancelled_scans.add(scan_id)
         scan.status = ScanStatusEnum.CANCELLED
         await db.commit()
         
@@ -244,6 +268,132 @@ async def cancel_scan(
     except Exception as e:
         logger.error(f"Error cancelling scan: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to cancel scan")
+
+
+@router.post("/{scan_id}/rescan")
+async def rescan(
+    scan_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new scan from the original immutable authorization scope."""
+    from sqlalchemy import select
+
+    result = await db.execute(select(Scan).where(Scan.id == scan_id))
+    original = result.scalar_one_or_none()
+    if not original:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    new_scan_id = str(uuid.uuid4())
+    scan = Scan(
+        id=new_scan_id,
+        target=original.target,
+        scope=original.scope,
+        mode=original.mode,
+        status=ScanStatusEnum.PENDING,
+        llm_provider=original.llm_provider,
+        llm_model=original.llm_model,
+        current_stage="pending",
+    )
+    db.add(scan)
+    await db.commit()
+    background_tasks.add_task(
+        _execute_scan_background,
+        scan_id=new_scan_id,
+        target=scan.target,
+        scope=scan.scope or "",
+        mode=scan.mode,
+        llm_provider=scan.llm_provider,
+        llm_model=scan.llm_model,
+    )
+    return {"scan_id": new_scan_id, "status": "pending", "message": "Rescan queued"}
+
+
+@router.post("/{scan_id}/schedule")
+async def schedule_scan(
+    scan_id: str,
+    request: ScheduleRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Schedule a one-shot rescan without changing the original scope."""
+    from sqlalchemy import select
+
+    result = await db.execute(select(Scan).where(Scan.id == scan_id))
+    original = result.scalar_one_or_none()
+    if not original:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    run_at = request.run_at if request.run_at.tzinfo else request.run_at.replace(tzinfo=timezone.utc)
+    run_at = run_at.astimezone(timezone.utc)
+    if run_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="run_at must be in the future")
+    schedule_id = str(uuid.uuid4())
+    _scheduled_scans[schedule_id] = {"scan_id": scan_id, "run_at": run_at.isoformat(), "status": "scheduled"}
+    asyncio.create_task(_run_scheduled_scan(schedule_id, run_at, original))
+    return {"schedule_id": schedule_id, **_scheduled_scans[schedule_id]}
+
+
+async def _run_scheduled_scan(schedule_id: str, run_at: datetime, original: Scan) -> None:
+    await asyncio.sleep(max(0, (run_at - datetime.now(timezone.utc)).total_seconds()))
+    async with AsyncSessionLocal() as db_session:
+        new_scan_id = str(uuid.uuid4())
+        scan = Scan(
+            id=new_scan_id,
+            target=original.target,
+            scope=original.scope,
+            mode=original.mode,
+            status=ScanStatusEnum.PENDING,
+            llm_provider=original.llm_provider,
+            llm_model=original.llm_model,
+            current_stage="pending",
+        )
+        db_session.add(scan)
+        await db_session.commit()
+        _scheduled_scans[schedule_id].update({"status": "queued", "new_scan_id": new_scan_id})
+        await _execute_scan_background(
+            new_scan_id, scan.target, scan.scope or "", scan.mode, scan.llm_provider, scan.llm_model
+        )
+
+
+@router.get("/{scan_id}/events")
+async def get_scan_event_stream(scan_id: str, after: int = 0):
+    """Return recent live orchestration and tool events for a scan."""
+    return {"events": get_scan_events(scan_id, after)}
+
+
+@router.post("/{scan_id}/approve")
+async def approve_scan(
+    scan_id: str,
+    request: ApprovalRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Release a human-review scan only after an explicit reviewer token."""
+    from sqlalchemy import select
+
+    result = await db.execute(select(Scan).where(Scan.id == scan_id))
+    scan = result.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status != ScanStatusEnum.AWAITING_REVIEW:
+        raise HTTPException(status_code=400, detail="Scan is not awaiting human review")
+    try:
+        scope_document = ScopeDocument.model_validate_json(scan.scope or "{}")
+        scope_document = scope_document.model_copy(update={"approval_token": request.approval_token})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid stored scope: {exc}") from exc
+    scan.scope = scope_document.model_dump_json()
+    scan.status = ScanStatusEnum.PENDING
+    await db.commit()
+    background_tasks.add_task(
+        _execute_scan_background,
+        scan_id=scan.id,
+        target=scan.target,
+        scope=scan.scope,
+        mode=scope_document.mode.value,
+        llm_provider=scan.llm_provider,
+        llm_model=scan.llm_model,
+    )
+    publish_scan_event(scan.id, "human_review_approved")
+    return {"scan_id": scan.id, "status": "pending", "message": "Human approval recorded"}
 
 @router.get("/list/all")
 async def list_scans(
@@ -292,54 +442,57 @@ async def _execute_scan_background(
     mode: str,
     llm_provider: str,
     llm_model: str,
-    db_session: AsyncSession
 ):
     """Execute scan in background"""
+    if scan_id in _cancelled_scans:
+        return
     try:
-        # Get orchestrator
-        orchestrator = get_orchestrator(db_session)
-        
-        # Update scan status
-        from sqlalchemy import select, update
-        
-        scan_update = update(Scan).where(Scan.id == scan_id).values(
-            status=ScanStatusEnum.RUNNING,
-            current_stage="reconnaissance"
-        )
-        await db_session.execute(scan_update)
-        await db_session.commit()
-        
-        # Execute scan workflow
-        result = await orchestrator.execute_scan(
-            scan_id=scan_id,
-            target=target,
-            scope=scope,
-            mode=mode,
-            llm_provider=llm_provider,
-            llm_model=llm_model
-        )
-        
-        # Update scan with results
-        scan_update = update(Scan).where(Scan.id == scan_id).values(
-            status=ScanStatusEnum.COMPLETED if result.get('status') == 'completed' else ScanStatusEnum.FAILED,
-            vulnerabilities_found=len(result.get('verified_vulnerabilities', [])),
-            progress_percentage=100.0 if result.get('status') == 'completed' else 0.0,
-            error_message=result.get('error', '')
-        )
-        await db_session.execute(scan_update)
-        await db_session.commit()
-        
-        logger.info(f"✅ Scan {scan_id} completed successfully")
-    
-    except Exception as e:
-        logger.error(f"❌ Background scan failed: {str(e)}")
-        try:
+        async with AsyncSessionLocal() as db_session:
+            orchestrator = get_orchestrator(db_session)
             from sqlalchemy import update
+
             scan_update = update(Scan).where(Scan.id == scan_id).values(
-                status=ScanStatusEnum.FAILED,
-                error_message=str(e)
+                status=ScanStatusEnum.RUNNING,
+                current_stage="reconnaissance"
             )
             await db_session.execute(scan_update)
             await db_session.commit()
-        except:
-            pass
+
+            result = await orchestrator.execute_scan(
+                scan_id=scan_id,
+                target=target,
+                scope=scope,
+                mode=mode,
+                llm_provider=llm_provider,
+                llm_model=llm_model
+            )
+
+            if scan_id in _cancelled_scans:
+                return
+
+            scan_update = update(Scan).where(Scan.id == scan_id).values(
+                status=(ScanStatusEnum.COMPLETED if result.get('status') == 'completed' else
+                        ScanStatusEnum.CANCELLED if result.get('status') == 'cancelled' else
+                        ScanStatusEnum.FAILED),
+                vulnerabilities_found=len(result.get('verified_vulnerabilities', [])),
+                progress_percentage=100.0 if result.get('status') == 'completed' else 0.0,
+                error_message=result.get('error', '')
+            )
+            await db_session.execute(scan_update)
+            await db_session.commit()
+        
+            logger.info(f"✅ Scan {scan_id} completed successfully")
+    
+    except Exception as e:
+        logger.error(f"❌ Background scan failed: {str(e)}")
+        async with AsyncSessionLocal() as db_session:
+            try:
+                from sqlalchemy import update
+                scan_update = update(Scan).where(Scan.id == scan_id).values(
+                    status=ScanStatusEnum.FAILED,
+                    error_message=str(e)
+                )
+                await db_session.execute(scan_update)
+                await db_session.commit()
+            except Exception:
+                logger.exception("Could not persist failed scan status for %s", scan_id)
