@@ -58,6 +58,7 @@ class ScanResultsResponse(BaseModel):
     vulnerabilities: list
     recommendations: list
     risk_score: float
+    error: Optional[str] = None
 
 
 class ApprovalRequest(BaseModel):
@@ -186,7 +187,8 @@ async def get_scan_results(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Get results of a completed scan
+    Get results of a scan.
+    Returns results for completed scans, or current findings/error for in-progress and failed scans.
     """
     try:
         from sqlalchemy import select
@@ -197,35 +199,47 @@ async def get_scan_results(
         if not scan:
             raise HTTPException(status_code=404, detail="Scan not found")
         
-        if scan.status != ScanStatusEnum.COMPLETED:
-            raise HTTPException(status_code=400, detail="Scan is not completed yet")
-        
-        # Get vulnerabilities
+        # Get vulnerabilities (will return whatever has been discovered so far)
         vulns_result = await db.execute(
             select(Vulnerability).where(Vulnerability.scan_id == scan_id)
         )
         vulnerabilities = vulns_result.scalars().all()
+
+        # Parse recommendations from findings_json if present
+        recommendations = [
+            "Review and patch vulnerabilities by severity",
+            "Implement Web Application Firewall (WAF)",
+            "Regular security assessments recommended"
+        ]
+        if scan.findings_json and isinstance(scan.findings_json, dict):
+            recommendations = scan.findings_json.get("recommendations", recommendations)
         
+        # Calculate comprehensive risk score based on severity weights
+        crit = sum(1 for v in vulnerabilities if getattr(v.severity, "value", v.severity) == "critical")
+        high = sum(1 for v in vulnerabilities if getattr(v.severity, "value", v.severity) == "high")
+        med = sum(1 for v in vulnerabilities if getattr(v.severity, "value", v.severity) == "medium")
+        low = sum(1 for v in vulnerabilities if getattr(v.severity, "value", v.severity) == "low")
+        risk_score = min(10.0, round(crit * 3.5 + high * 2.5 + med * 1.5 + low * 0.5, 1))
+
         return ScanResultsResponse(
             scan_id=scan.id,
             target=scan.target,
-            status=scan.status.value,
+            status=scan.status.value if scan.status else "unknown",
             vulnerabilities=[
                 {
                     "id": v.id,
                     "title": v.title,
-                    "severity": v.severity.value if v.severity else "unknown",
+                    "severity": v.severity.value if hasattr(v.severity, "value") else str(v.severity or "unknown"),
                     "type": v.vulnerability_type,
-                    "description": v.description
+                    "description": v.description,
+                    "affected_endpoint": v.affected_endpoint,
+                    "verified": v.verified,
                 }
                 for v in vulnerabilities
             ],
-            recommendations=[
-                "Review and patch vulnerabilities by severity",
-                "Implement Web Application Firewall (WAF)",
-                "Regular security assessments recommended"
-            ],
-            risk_score=len([v for v in vulnerabilities if v.severity in ["critical", "high"]]) * 2.5
+            recommendations=recommendations,
+            risk_score=risk_score,
+            error=scan.error_message
         )
     
     except HTTPException:
@@ -260,14 +274,103 @@ async def cancel_scan(
         await db.commit()
         
         logger.info(f"Scan {scan_id} cancelled")
-        
         return {"message": "Scan cancelled successfully"}
-    
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error cancelling scan: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to cancel scan")
+
+
+class ExploitRequest(BaseModel):
+    mode: str | None = None
+    llm_provider: str | None = None
+    llm_model: str | None = None
+
+
+@router.post("/{scan_id}/exploit")
+async def run_exploitation(
+    scan_id: str,
+    request: ExploitRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    On-demand Exploitation Agent execution for a scan.
+    Verifies vulnerabilities with the assigned AI model (e.g. Gemini, OpenAI, Claude, Ollama)
+    and attaches proof-of-concept evidence.
+    """
+    from sqlalchemy import select
+    from agents.exploitation_agent import ExploitationVerificationAgent
+    from security.scope import ScopeDocument, ScopeTarget
+
+    scan_res = await db.execute(select(Scan).where(Scan.id == scan_id))
+    scan = scan_res.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    vulns_res = await db.execute(select(Vulnerability).where(Vulnerability.scan_id == scan_id))
+    vulns = list(vulns_res.scalars().all())
+
+    if not vulns:
+        return {
+            "scan_id": scan_id,
+            "status": "no_findings",
+            "message": "No vulnerabilities recorded to exploit or verify.",
+            "verified_count": 0,
+        }
+
+    vuln_dicts = [
+        {
+            "id": v.id,
+            "title": v.title,
+            "type": v.vulnerability_type,
+            "description": v.description,
+            "severity": v.severity.value if v.severity else "medium",
+            "affected_endpoint": v.affected_endpoint or scan.target,
+        }
+        for v in vulns
+    ]
+
+    try:
+        scope_doc = ScopeDocument.model_validate_json(scan.scope or "{}")
+    except Exception:
+        scope_doc = ScopeDocument(targets=[ScopeTarget(host=scan.target)])
+
+    exploit_agent = ExploitationVerificationAgent()
+    provider = (request.llm_provider if request else None) or scan.llm_provider or settings.ACTIVE_LLM
+    model = (request.llm_model if request else None) or scan.llm_model
+
+    verification_result = await exploit_agent.verify_findings(
+        scan_id=scan_id,
+        target=scan.target,
+        scope_document=scope_doc,
+        discovered_vulnerabilities=vuln_dicts,
+        recon_data={"open_ports": [], "http_security": {}},
+        preferred_provider=provider,
+        preferred_model=model,
+    )
+
+    verified = verification_result.get("verified", [])
+    verified_map = {v["title"].lower(): v for v in verified}
+
+    for v_row in vulns:
+        if v_row.title.lower() in verified_map:
+            v_row.verified = True
+            v_row.proof_of_concept = verified_map[v_row.title.lower()].get("poc", "")
+
+    await db.commit()
+
+    publish_scan_event(scan_id, "exploitation_completed", verified=len(verified))
+
+    return {
+        "scan_id": scan_id,
+        "status": "completed",
+        "verified_count": len(verified),
+        "total_findings": len(vulns),
+        "verified_findings": verified,
+        "message": f"Exploitation agent completed verification: {len(verified)} / {len(vulns)} verified.",
+    }
+
 
 
 @router.post("/{scan_id}/rescan")
@@ -474,7 +577,7 @@ async def _execute_scan_background(
                 status=(ScanStatusEnum.COMPLETED if result.get('status') == 'completed' else
                         ScanStatusEnum.CANCELLED if result.get('status') == 'cancelled' else
                         ScanStatusEnum.FAILED),
-                vulnerabilities_found=len(result.get('verified_vulnerabilities', [])),
+                vulnerabilities_found=len(result.get('discovered_vulnerabilities', [])) or len(result.get('verified_vulnerabilities', [])),
                 progress_percentage=100.0 if result.get('status') == 'completed' else 0.0,
                 error_message=result.get('error', '')
             )

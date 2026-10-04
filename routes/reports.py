@@ -40,6 +40,7 @@ async def list_reports(db: AsyncSession = Depends(get_db)) -> dict:
                 "format": report.report_format,
                 "generated_at": report.generated_at.isoformat(),
                 "risk_score": report.overall_risk_score,
+                "download": f"/api/reports/{report.id}/download",
             }
             for report in reports
         ],
@@ -95,6 +96,72 @@ async def download_report(report_id: str, db: AsyncSession = Depends(get_db)):
     return FileResponse(report.report_path, media_type="application/pdf", filename=f"security-report-{report.scan_id}.pdf")
 
 
+@router.get("/scan/{scan_id}/download")
+async def download_report_by_scan_id(scan_id: str, db: AsyncSession = Depends(get_db)):
+    """Directly download the PDF report for a scan by scan_id."""
+    result = await db.execute(
+        select(Report).where(Report.scan_id == scan_id).order_by(desc(Report.generated_at))
+    )
+    report = result.scalars().first()
+    if report and Path(report.report_path).is_file():
+        return FileResponse(
+            report.report_path,
+            media_type="application/pdf",
+            filename=f"security-report-{scan_id}.pdf",
+        )
+
+    # Check for direct file in reports storage
+    direct_file = Path(settings.REPORT_STORAGE_PATH) / f"{scan_id}.pdf"
+    if direct_file.is_file():
+        return FileResponse(
+            str(direct_file),
+            media_type="application/pdf",
+            filename=f"security-report-{scan_id}.pdf",
+        )
+
+    # Auto-generate on-demand if scan is completed
+    scan_result = await db.execute(select(Scan).where(Scan.id == scan_id))
+    scan = scan_result.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status != ScanStatusEnum.COMPLETED:
+        raise HTTPException(status_code=400, detail="Scan is not completed yet")
+
+    vuln_result = await db.execute(select(Vulnerability).where(Vulnerability.scan_id == scan.id))
+    vulnerabilities = list(vuln_result.scalars().all())
+    output_dir = Path(settings.REPORT_STORAGE_PATH)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    new_report_id = str(uuid.uuid4())
+    output_path = output_dir / f"{new_report_id}.pdf"
+    _write_pdf(output_path, scan, vulnerabilities)
+
+    counts = {severity: sum(1 for item in vulnerabilities if item.severity == severity) for severity in SeverityEnum}
+    risk_score = min(10.0, counts[SeverityEnum.CRITICAL] * 4 + counts[SeverityEnum.HIGH] * 2.5 + counts[SeverityEnum.MEDIUM])
+    new_report = Report(
+        id=new_report_id,
+        scan_id=scan.id,
+        title=f"Security assessment: {scan.target}",
+        report_format="pdf",
+        report_path=str(output_path),
+        total_vulnerabilities=len(vulnerabilities),
+        critical_count=counts[SeverityEnum.CRITICAL],
+        high_count=counts[SeverityEnum.HIGH],
+        medium_count=counts[SeverityEnum.MEDIUM],
+        low_count=counts[SeverityEnum.LOW],
+        overall_risk_score=risk_score,
+    )
+    db.add(new_report)
+    scan.report_generated = True
+    scan.report_path = str(output_path)
+    await db.commit()
+
+    return FileResponse(
+        str(output_path),
+        media_type="application/pdf",
+        filename=f"security-report-{scan_id}.pdf",
+    )
+
+
 def _write_pdf(path: Path, scan: Scan, vulnerabilities: list[Vulnerability]) -> None:
     styles = getSampleStyleSheet()
     document = SimpleDocTemplate(str(path), pagesize=letter, rightMargin=0.65 * inch, leftMargin=0.65 * inch)
@@ -135,9 +202,4 @@ def _write_pdf(path: Path, scan: Scan, vulnerabilities: list[Vulnerability]) -> 
     ])
     document.build(story)
 
-router = APIRouter()
 
-
-@router.get("/")
-async def list_reports() -> dict:
-    return {"reports": [], "total": 0}

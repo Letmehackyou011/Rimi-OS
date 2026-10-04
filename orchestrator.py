@@ -1,24 +1,41 @@
 """
-AI Agent Orchestrator - Coordinates multiple agents
-Using LangGraph for multi-agent orchestration
+AI Multi-Agent Security Orchestrator - Coordinates 4 specialized agents:
+1. Reconnaissance Agent (OSINT, DNS, subdomain enumeration, port scanning, HTTP security)
+2. Vulnerability Analysis Agent (CVE detection, OWASP Top-10 classification, CVSS scoring)
+3. Exploitation Agent (Controlled testing with strict safety guardrails)
+4. Reporting Agent (Automated ReportLab PDF & executive documentation)
+
+Equipped with per-agent specialized model routing and cascading fallback chains.
 """
 
-import logging
-import json
-from typing import Dict, Any, TypedDict, List
+from __future__ import annotations
+
 from datetime import datetime
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, TypedDict
+import uuid
 
 from langgraph.graph import StateGraph
-from utils.llm_client import get_llm_client
-from database.models import Scan, Vulnerability, Report, SeverityEnum
+
+from agents.exploitation_agent import ExploitationVerificationAgent
+from agents.reporting_agent import ReportingAgent
+from agents.vuln_analysis_agent import VulnerabilityAnalysisAgent
+from config.settings import settings
+from database.db import AsyncSessionLocal
+from database.models import Report, Scan, SeverityEnum, Vulnerability
 from security.events import is_scan_cancelled, publish_scan_event
+from security.recon_tools import run_full_reconnaissance_native
 from security.scope import ScopeDocument, ScopeTarget
 from security.tool_runner import run_reconnaissance
+from utils.llm_router import get_llm_router
 
 logger = logging.getLogger(__name__)
 
+
 class ScanState(TypedDict):
-    """State for the scanning workflow"""
+    """Workflow state passed through the LangGraph multi-agent pipeline."""
     scan_id: str
     target: str
     scope: str
@@ -26,354 +43,424 @@ class ScanState(TypedDict):
     status: str
     llm_provider: str
     llm_model: str
-    
-    # Reconnaissance results
+
+    # Agent 1: Reconnaissance
     reconnaissance_results: Dict[str, Any]
     tool_results: List[Dict[str, Any]]
+
+    # Agent 2: Vulnerability Analysis
     discovered_vulnerabilities: List[Dict[str, Any]]
-    
-    # Exploitation results
-    exploitation_results: Dict[str, Any]
+
+    # Agent 3: Exploitation / Verification
     verified_vulnerabilities: List[Dict[str, Any]]
-    
-    # Reporting results
-    report_path: str
+    exploitation_results: Dict[str, Any]
+
+    # Agent 4: Reporting
     report_findings: Dict[str, Any]
-    
-    # Metadata
+    report_path: str
+
+    # Metadata & Tracking
     start_time: str
     stage: str
     error: str
+    models_used: Dict[str, str]
+
 
 class SecurityAgentOrchestrator:
-    """Orchestrates security scanning agents"""
-    
+    """Coordinates the 4-agent security assessment workflow."""
+
     def __init__(self, db_session=None):
         self.db_session = db_session
-        self._llm_clients = {}
+        self.router = get_llm_router()
+        self.vuln_agent = VulnerabilityAnalysisAgent()
+        self.exploit_agent = ExploitationVerificationAgent()
+        self.report_agent = ReportingAgent()
         self.graph = self._build_graph()
 
-    def _client_for_state(self, state: ScanState):
-        """Resolve and cache the LangChain model selected for this scan."""
-        key = (state["llm_provider"], state["llm_model"])
-        if key not in self._llm_clients:
-            self._llm_clients[key] = get_llm_client(*key)
-        return self._llm_clients[key]
-    
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow"""
+    def _build_graph(self) -> Any:
+        """Construct the 4-agent LangGraph workflow."""
         graph = StateGraph(ScanState)
-        
-        # Add nodes
-        graph.add_node("reconnaissance", self._reconnaissance_agent)
-        graph.add_node("exploitation", self._exploitation_agent)
-        graph.add_node("reporting", self._reporting_agent)
-        
-        # Add edges
-        graph.add_edge("reconnaissance", "exploitation")
+
+        # 4 Specialized Nodes
+        graph.add_node("reconnaissance", self._reconnaissance_node)
+        graph.add_node("vulnerability_analysis", self._vulnerability_analysis_node)
+        graph.add_node("exploitation", self._exploitation_node)
+        graph.add_node("reporting", self._reporting_node)
+
+        # Sequential Pipeline Edges
+        graph.add_edge("reconnaissance", "vulnerability_analysis")
+        graph.add_edge("vulnerability_analysis", "exploitation")
         graph.add_edge("exploitation", "reporting")
-        
-        # Set entry point
-        graph.set_entry_point("reconnaissance")
-        
-        # Set finish point
-        graph.set_finish_point("reporting")
-        
+
+        # Entry and Exit Points
+        if hasattr(graph, "set_entry_point"):
+            graph.set_entry_point("reconnaissance")
+            graph.set_finish_point("reporting")
+        else:
+            from langgraph.graph import END, START
+            graph.add_edge(START, "reconnaissance")
+            graph.add_edge("reporting", END)
+
         return graph.compile()
-    
-    async def _reconnaissance_agent(self, state: ScanState) -> ScanState:
-        """
-        Reconnaissance Agent
-        - Scans target for vulnerabilities
-        - Uses LLM to analyze findings
-        """
-        logger.info(f"🔍 Starting reconnaissance on {state['target']}")
-        state['stage'] = 'reconnaissance'
-        await self._persist_progress(state['scan_id'], 'reconnaissance', 10.0)
-        if is_scan_cancelled(state['scan_id']):
-            state['status'] = 'cancelled'
+
+    # ------------------------------------------------------------------
+    # Agent 1: Reconnaissance
+    # ------------------------------------------------------------------
+    async def _reconnaissance_node(self, state: ScanState) -> ScanState:
+        """Agent 1: OSINT, DNS resolution, port scanning, and HTTP security inspection."""
+        scan_id = state["scan_id"]
+        target = state["target"]
+        logger.info(f"🔍 Agent 1 (Reconnaissance) starting on {target}")
+
+        state["stage"] = "reconnaissance"
+        await self._persist_progress(scan_id, "reconnaissance", 15.0)
+        publish_scan_event(scan_id, "stage_started", stage="reconnaissance")
+
+        if is_scan_cancelled(scan_id):
+            state["status"] = "cancelled"
             return state
-        publish_scan_event(state['scan_id'], "stage_started", stage="reconnaissance")
-        
+
         try:
-            scope_document = ScopeDocument.model_validate_json(state['scope'])
-            tool_results = await run_reconnaissance(scope_document, state['scan_id'])
-            state['tool_results'] = tool_results
-            # Build reconnaissance prompt
-            prompt = self._build_recon_prompt(state, tool_results)
-            
-            # Get LLM response
-            response = await self._client_for_state(state).generate(prompt)
-            
-            # Parse findings
-            findings = self._parse_findings(response)
-            
-            state['reconnaissance_results'] = {
-                "summary": findings,
-                "timestamp": datetime.utcnow().isoformat(),
-                "vulnerabilities_found": len(findings.get('vulnerabilities', []))
-            }
-            
-            state['discovered_vulnerabilities'] = findings.get('vulnerabilities', [])
-            await self._persist_progress(state['scan_id'], 'reconnaissance', 35.0)
-            
-            logger.info(f"✅ Reconnaissance complete: {len(state['discovered_vulnerabilities'])} vulnerabilities found")
-            publish_scan_event(
-                state['scan_id'],
-                "stage_finished",
-                stage="reconnaissance",
-                vulnerabilities=len(state['discovered_vulnerabilities']),
+            # 1. Native OSINT & Network reconnaissance (DNS, Subdomains, Ports, HTTP)
+            native_recon = await run_full_reconnaissance_native(target)
+            state["reconnaissance_results"] = native_recon
+
+            # 2. Scope-bounded external tools (nmap, curl if configured)
+            try:
+                scope_doc = ScopeDocument.model_validate_json(state["scope"])
+                tool_results = await run_reconnaissance(scope_doc, scan_id)
+                state["tool_results"] = tool_results
+            except Exception as e:
+                logger.warning(f"External tool execution skipped: {e}")
+                state["tool_results"] = []
+
+            # 3. AI synthesis of reconnaissance evidence
+            prompt = f"""
+Analyze the initial reconnaissance data for target {target}:
+DNS: {native_recon.get('dns')}
+OPEN PORTS: {native_recon.get('open_ports')}
+HTTP HEADERS & SECURITY: {native_recon.get('http_security')}
+Provide a concise overview of the external attack surface.
+"""
+            llm_res = await self.router.generate_for_agent(
+                agent_name="reconnaissance",
+                prompt=prompt,
+                preferred_provider=state["llm_provider"],
+                preferred_model=state["llm_model"],
             )
-            
+            state["models_used"]["reconnaissance"] = f"{llm_res.get('provider_used')}/{llm_res.get('model_used')}"
+
+            await self._persist_progress(scan_id, "reconnaissance", 35.0)
+            publish_scan_event(
+                scan_id, "stage_finished", stage="reconnaissance",
+                ports=len(native_recon.get("open_ports", [])),
+                model=state["models_used"]["reconnaissance"],
+            )
+            logger.info(f"✅ Reconnaissance complete for {target}")
+
         except Exception as e:
-            logger.error(f"❌ Reconnaissance failed: {str(e)}")
-            state['error'] = f"Reconnaissance error: {str(e)}"
-            state['status'] = "failed"
-            publish_scan_event(state['scan_id'], "stage_failed", stage="reconnaissance", error=str(e))
-        
-        return state
-    
-    async def _exploitation_agent(self, state: ScanState) -> ScanState:
-        """
-        Exploitation Agent
-        - Tests discovered vulnerabilities
-        - Verifies security issues
-        """
-        logger.info("⚔️ Starting exploitation verification")
-        state['stage'] = 'exploitation'
-        await self._persist_progress(state['scan_id'], 'validation', 45.0)
-        if is_scan_cancelled(state['scan_id']):
-            state['status'] = 'cancelled'
-            return state
-        publish_scan_event(state['scan_id'], "stage_started", stage="verification")
-        
-        try:
-            if not state['discovered_vulnerabilities']:
-                logger.info("No vulnerabilities to exploit")
-                state['exploitation_results'] = {"verified": [], "failed": []}
-                return state
-            
-            verified = []
-            failed = []
-            
-            # Test each vulnerability
-            for vuln in state['discovered_vulnerabilities'][:5]:  # Limit to 5 for demo
-                if is_scan_cancelled(state['scan_id']):
-                    state['status'] = 'cancelled'
-                    return state
-                prompt = self._build_exploitation_prompt(state, vuln)
-                
-                try:
-                    response = await self._client_for_state(state).generate(prompt)
-                    verification = self._parse_verification(response)
-                    
-                    if verification.get('verified', False):
-                        verified.append(vuln)
-                    else:
-                        failed.append(vuln)
-                
-                except Exception as e:
-                    logger.warning(f"Failed to verify {vuln.get('title')}: {str(e)}")
-                    failed.append(vuln)
-            
-            state['exploitation_results'] = {
-                "verified_count": len(verified),
-                "failed_count": len(failed),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            
-            state['verified_vulnerabilities'] = verified
-            await self._persist_progress(state['scan_id'], 'validation', 65.0)
-            
-            logger.info(f"✅ Exploitation complete: {len(verified)} verified")
-            publish_scan_event(state['scan_id'], "stage_finished", stage="verification", verified=len(verified))
-            
-        except Exception as e:
-            logger.error(f"❌ Exploitation failed: {str(e)}")
-            state['error'] = f"Exploitation error: {str(e)}"
-            state['status'] = "failed"
-        
-        return state
-    
-    async def _reporting_agent(self, state: ScanState) -> ScanState:
-        """
-        Reporting Agent
-        - Generates comprehensive security report
-        """
-        logger.info("📄 Generating security report")
-        state['stage'] = 'reporting'
-        await self._persist_progress(state['scan_id'], 'reporting', 80.0)
-        if is_scan_cancelled(state['scan_id']):
-            state['status'] = 'cancelled'
-            return state
-        publish_scan_event(state['scan_id'], "stage_started", stage="reporting")
-        
-        try:
-            # Build report prompt
-            prompt = self._build_report_prompt(state)
-            
-            # Generate report
-            response = await self._client_for_state(state).generate(prompt)
-            
-            report_data = self._parse_report(response, state)
-            
-            state['report_findings'] = report_data
-            state['report_path'] = f"reports/{state['scan_id']}.pdf"
-            state['status'] = "completed"
-            await self._persist_progress(state['scan_id'], 'completed', 100.0)
-            
-            logger.info(f"✅ Report generated successfully")
-            publish_scan_event(state['scan_id'], "stage_finished", stage="reporting")
-            
-        except Exception as e:
-            logger.error(f"❌ Report generation failed: {str(e)}")
-            state['error'] = f"Reporting error: {str(e)}"
-            state['status'] = "failed"
-        
+            logger.error(f"❌ Reconnaissance node failed: {e}", exc_info=True)
+            state["error"] = f"Reconnaissance error: {e}"
+
         return state
 
+    # ------------------------------------------------------------------
+    # Agent 2: Vulnerability Analysis
+    # ------------------------------------------------------------------
+    async def _vulnerability_analysis_node(self, state: ScanState) -> ScanState:
+        """Agent 2: Deep CVE detection, OWASP Top-10 classification, and CVSS scoring."""
+        scan_id = state["scan_id"]
+        target = state["target"]
+        logger.info(f"🧠 Agent 2 (Vulnerability Analysis) analyzing {target}")
+
+        state["stage"] = "vulnerability_analysis"
+        await self._persist_progress(scan_id, "vulnerability_analysis", 50.0)
+        publish_scan_event(scan_id, "stage_started", stage="vulnerability_analysis")
+
+        if is_scan_cancelled(scan_id):
+            state["status"] = "cancelled"
+            return state
+
+        try:
+            recon_data = state.get("reconnaissance_results", {})
+            vulnerabilities = await self.vuln_agent.analyze(
+                target=target,
+                recon_data=recon_data,
+                preferred_provider=state["llm_provider"],
+                preferred_model=state["llm_model"],
+            )
+            state["discovered_vulnerabilities"] = vulnerabilities
+
+            # Persist discovered vulnerabilities to DB
+            await self._persist_vulnerabilities(scan_id, vulnerabilities)
+
+            await self._persist_progress(scan_id, "vulnerability_analysis", 65.0)
+            publish_scan_event(
+                scan_id, "stage_finished", stage="vulnerability_analysis",
+                vulnerabilities_found=len(vulnerabilities),
+            )
+            logger.info(f"✅ Vulnerability Analysis complete: {len(vulnerabilities)} findings identified")
+
+        except Exception as e:
+            logger.error(f"❌ Vulnerability Analysis failed: {e}", exc_info=True)
+            state["error"] = f"Analysis error: {e}"
+
+        return state
+
+    # ------------------------------------------------------------------
+    # Agent 3: Exploitation & Verification
+    # ------------------------------------------------------------------
+    async def _exploitation_node(self, state: ScanState) -> ScanState:
+        """Agent 3: Controlled verification with safety guardrails and policy enforcement."""
+        scan_id = state["scan_id"]
+        target = state["target"]
+        logger.info(f"⚔️ Agent 3 (Exploitation) executing verification on {target}")
+
+        state["stage"] = "exploitation"
+        await self._persist_progress(scan_id, "validation", 75.0)
+        publish_scan_event(scan_id, "stage_started", stage="exploitation")
+
+        if is_scan_cancelled(scan_id):
+            state["status"] = "cancelled"
+            return state
+
+        try:
+            scope_doc = ScopeDocument.model_validate_json(state["scope"])
+            discovered = state.get("discovered_vulnerabilities", [])
+            recon_data = state.get("reconnaissance_results", {})
+
+            verification_result = await self.exploit_agent.verify_findings(
+                scan_id=scan_id,
+                target=target,
+                scope_document=scope_doc,
+                discovered_vulnerabilities=discovered,
+                recon_data=recon_data,
+                preferred_provider=state["llm_provider"],
+                preferred_model=state["llm_model"],
+            )
+
+            state["exploitation_results"] = verification_result
+            verified = verification_result.get("verified", [])
+            state["verified_vulnerabilities"] = verified
+
+            # Update verification flags in DB
+            await self._update_verified_vulnerabilities(scan_id, verified)
+
+            await self._persist_progress(scan_id, "validation", 85.0)
+            publish_scan_event(
+                scan_id, "stage_finished", stage="exploitation",
+                verified_count=len(verified),
+            )
+            logger.info(f"✅ Exploitation verification complete: {len(verified)} findings verified")
+
+        except Exception as e:
+            logger.error(f"❌ Exploitation node failed: {e}", exc_info=True)
+            state["error"] = f"Verification error: {e}"
+
+        return state
+
+    # ------------------------------------------------------------------
+    # Agent 4: Reporting
+    # ------------------------------------------------------------------
+    async def _reporting_node(self, state: ScanState) -> ScanState:
+        """Agent 4: Synthesize documentation, create PDF/HTML reports, and record in DB."""
+        scan_id = state["scan_id"]
+        target = state["target"]
+        logger.info(f"📄 Agent 4 (Reporting) generating assessment report for {target}")
+
+        state["stage"] = "reporting"
+        await self._persist_progress(scan_id, "reporting", 90.0)
+        publish_scan_event(scan_id, "stage_started", stage="reporting")
+
+        if is_scan_cancelled(scan_id):
+            state["status"] = "cancelled"
+            return state
+
+        try:
+            report_id = str(uuid.uuid4())
+            recon_data = state.get("reconnaissance_results", {})
+            vulnerabilities = state.get("discovered_vulnerabilities", [])
+            verified = state.get("verified_vulnerabilities", [])
+
+            # Generate narrative
+            narrative = await self.report_agent.generate_report_narrative(
+                target=target,
+                mode=state.get("mode", "safe"),
+                recon_data=recon_data,
+                vulnerabilities=vulnerabilities,
+                preferred_provider=state["llm_provider"],
+                preferred_model=state["llm_model"],
+            )
+            state["report_findings"] = narrative
+
+            # Build official PDF report
+            pdf_path = await self.report_agent.create_pdf_report(
+                report_id=report_id,
+                scan_id=scan_id,
+                target=target,
+                mode=state.get("mode", "safe"),
+                vulnerabilities=vulnerabilities,
+                narrative=narrative,
+                recon_data=recon_data,
+            )
+            state["report_path"] = str(pdf_path)
+
+            # Persist Report row into database
+            await self._persist_report_db(
+                report_id=report_id,
+                scan_id=scan_id,
+                target=target,
+                pdf_path=str(pdf_path),
+                narrative=narrative,
+                vulnerabilities=vulnerabilities,
+            )
+
+            state["status"] = "completed"
+            await self._persist_progress(scan_id, "completed", 100.0)
+            publish_scan_event(
+                scan_id, "stage_finished", stage="reporting",
+                report_id=report_id, download=f"/api/reports/{report_id}/download"
+            )
+            logger.info(f"✅ Report generated successfully: {pdf_path}")
+
+        except Exception as e:
+            logger.error(f"❌ Reporting node failed: {e}", exc_info=True)
+            state["error"] = f"Reporting error: {e}"
+            state["status"] = "failed"
+
+        return state
+
+    # ------------------------------------------------------------------
+    # Database Persistence Helpers
+    # ------------------------------------------------------------------
     async def _persist_progress(self, scan_id: str, stage: str, progress: float) -> None:
-        """Persist stage checkpoints so clients see real execution progress."""
+        """Update scan progress percentage and stage."""
         try:
             from sqlalchemy import update
-            from database.db import AsyncSessionLocal
-            from database.models import Scan
-
             async with AsyncSessionLocal() as session:
-                await session.execute(update(Scan).where(Scan.id == scan_id).values(
-                    current_stage=stage,
-                    progress_percentage=progress,
-                ))
+                await session.execute(
+                    update(Scan).where(Scan.id == scan_id).values(
+                        current_stage=stage,
+                        progress_percentage=progress,
+                    )
+                )
                 await session.commit()
         except Exception:
-            logger.warning("Could not persist progress for scan %s", scan_id, exc_info=True)
-        publish_scan_event(scan_id, 'progress', stage=stage, progress=progress)
-    
-    def _build_recon_prompt(self, state: ScanState, tool_results: List[Dict[str, Any]]) -> str:
-        """Build reconnaissance prompt"""
-        return f"""
-        You are a security researcher. Perform reconnaissance on the following target:
-        
-        Target: {state['target']}
-        Scope: {state['scope']}
-        Mode: {state['mode']}
-        
-        Analyze only the supplied reconnaissance evidence. Do not invent services or claim exploitation.
-        Identify potential vulnerabilities and security issues.
-        Tool evidence:
-        {json.dumps(tool_results, indent=2)}
-        Return a JSON response with:
-        {{
-            "summary": "brief summary",
-            "vulnerabilities": [
-                {{
-                    "title": "vulnerability name",
-                    "type": "type (sql_injection, xss, etc)",
-                    "severity": "critical|high|medium|low",
-                    "description": "detailed description",
-                    "affected_endpoint": "endpoint if applicable"
-                }}
-            ]
-        }}
-        """
-    
-    def _build_exploitation_prompt(self, state: ScanState, vuln: Dict) -> str:
-        """Build exploitation verification prompt"""
-        return f"""
-        Verification task: assess whether this finding is supported by the collected evidence. Do not execute exploitation,
-        credential attacks, payloads, persistence, or proof-of-concept commands:
-        
-        Target: {state['target']}
-        Vulnerability: {vuln.get('title')}
-        Type: {vuln.get('type')}
-        Description: {vuln.get('description')}
-        
-        Provide a JSON response with:
-        {{
-            "verified": true/false,
-            "proof_of_concept": "PoC if possible",
-            "risk_level": "high/medium/low",
-            "notes": "additional notes"
-        }}
-        """
-    
-    def _build_report_prompt(self, state: ScanState) -> str:
-        """Build report generation prompt"""
-        verified_count = len(state.get('verified_vulnerabilities', []))
-        total_count = len(state.get('discovered_vulnerabilities', []))
-        
-        return f"""
-        Generate a professional security assessment report:
-        
-        Target: {state['target']}
-        Vulnerabilities Discovered: {total_count}
-        Vulnerabilities Verified: {verified_count}
-        Mode: {state['mode']}
-        
-        Provide a detailed security report with:
-        - Executive Summary
-        - Vulnerability Details
-        - Risk Assessment
-        - Remediation Recommendations
-        
-        Return as JSON with these fields:
-        {{
-            "executive_summary": "summary",
-            "vulnerability_count": {verified_count},
-            "overall_risk_score": 0-10,
-            "recommendations": ["recommendation 1", "recommendation 2"],
-            "next_steps": "recommended next steps"
-        }}
-        """
-    
-    def _parse_findings(self, response: str) -> Dict[str, Any]:
-        """Parse LLM response for findings"""
+            logger.warning("Could not persist progress for %s", scan_id, exc_info=True)
+        publish_scan_event(scan_id, "progress", stage=stage, progress=progress)
+
+    async def _persist_vulnerabilities(self, scan_id: str, vulns: List[Dict[str, Any]]) -> None:
+        """Persist discovered vulnerabilities into database table."""
         try:
-            # Extract JSON from response
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"vulnerabilities": []}
+            from sqlalchemy import update
+            async with AsyncSessionLocal() as session:
+                for v in vulns:
+                    sev_str = str(v.get("severity", "medium")).lower()
+                    sev_enum = getattr(SeverityEnum, sev_str.upper(), SeverityEnum.MEDIUM)
+
+                    vuln_row = Vulnerability(
+                        id=str(uuid.uuid4()),
+                        scan_id=scan_id,
+                        title=str(v.get("title", "Untitled finding")),
+                        description=str(v.get("description", "")),
+                        severity=sev_enum,
+                        vulnerability_type=str(v.get("type", "misconfiguration")),
+                        affected_endpoint=str(v.get("affected_endpoint", "")),
+                        remediation=str(v.get("remediation", "")),
+                        cvss_score=float(v.get("cvss_score", 5.0)),
+                        verified=bool(v.get("verified", False)),
+                    )
+                    session.add(vuln_row)
+
+                await session.execute(
+                    update(Scan).where(Scan.id == scan_id).values(
+                        vulnerabilities_found=len(vulns)
+                    )
+                )
+                await session.commit()
+                logger.info(f"Saved {len(vulns)} vulnerabilities to database for scan {scan_id}")
         except Exception as e:
-            logger.warning(f"Failed to parse findings: {str(e)}")
-            return {"vulnerabilities": []}
-    
-    def _parse_verification(self, response: str) -> Dict[str, Any]:
-        """Parse verification response"""
+            logger.warning(f"Could not persist vulnerabilities: {e}", exc_info=True)
+
+    async def _update_verified_vulnerabilities(self, scan_id: str, verified_vulns: List[Dict[str, Any]]) -> None:
+        """Update verified flags and safe PoC in database."""
         try:
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"verified": False}
+            from sqlalchemy import select, update
+            verified_titles = {v.get("title", "").lower(): v for v in verified_vulns}
+            async with AsyncSessionLocal() as session:
+                rows = (await session.execute(
+                    select(Vulnerability).where(Vulnerability.scan_id == scan_id)
+                )).scalars().all()
+
+                for row in rows:
+                    if row.title.lower() in verified_titles:
+                        v_info = verified_titles[row.title.lower()]
+                        row.verified = True
+                        row.proof_of_concept = v_info.get("poc", "")
+                await session.commit()
         except Exception as e:
-            logger.warning(f"Failed to parse verification: {str(e)}")
-            return {"verified": False}
-    
-    def _parse_report(self, response: str, state: ScanState) -> Dict[str, Any]:
-        """Parse report response"""
+            logger.warning(f"Could not update verified vulnerabilities: {e}", exc_info=True)
+
+    async def _persist_report_db(
+        self,
+        report_id: str,
+        scan_id: str,
+        target: str,
+        pdf_path: str,
+        narrative: Dict[str, Any],
+        vulnerabilities: List[Dict[str, Any]],
+    ) -> None:
+        """Insert Report row into DB."""
         try:
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            return {
-                "executive_summary": "Report generated",
-                "vulnerability_count": len(state['verified_vulnerabilities']),
-                "overall_risk_score": 5.0
-            }
+            counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+            for v in vulnerabilities:
+                sev = str(v.get("severity", "low")).lower()
+                if sev in counts:
+                    counts[sev] += 1
+
+            async with AsyncSessionLocal() as session:
+                report = Report(
+                    id=report_id,
+                    scan_id=scan_id,
+                    title=f"Security Assessment: {target}",
+                    executive_summary=narrative.get("executive_summary", ""),
+                    report_format="pdf",
+                    report_path=pdf_path,
+                    total_vulnerabilities=len(vulnerabilities),
+                    critical_count=counts["critical"],
+                    high_count=counts["high"],
+                    medium_count=counts["medium"],
+                    low_count=counts["low"],
+                    overall_risk_score=float(narrative.get("overall_risk_score", 0.0)),
+                )
+                session.add(report)
+
+                from sqlalchemy import update
+                await session.execute(
+                    update(Scan).where(Scan.id == scan_id).values(
+                        report_generated=True,
+                        report_path=pdf_path,
+                    )
+                )
+                await session.commit()
         except Exception as e:
-            logger.warning(f"Failed to parse report: {str(e)}")
-            return {}
-    
-    async def execute_scan(self, scan_id: str, target: str, scope: str, mode: str, 
-                          llm_provider: str, llm_model: str) -> ScanState:
-        """Execute complete scan workflow"""
+            logger.warning(f"Could not save Report to DB: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Orchestrator Entrypoint
+    # ------------------------------------------------------------------
+    async def execute_scan(
+        self,
+        scan_id: str,
+        target: str,
+        scope: str,
+        mode: str,
+        llm_provider: str,
+        llm_model: str,
+    ) -> ScanState:
+        """Execute the complete multi-agent assessment workflow."""
         if not scope:
-            scope = ScopeDocument(
-                targets=[ScopeTarget(host=target)],
-            ).model_dump_json()
+            scope = ScopeDocument(targets=[ScopeTarget(host=target)]).model_dump_json()
 
         initial_state: ScanState = {
             "scan_id": scan_id,
@@ -386,27 +473,25 @@ class SecurityAgentOrchestrator:
             "reconnaissance_results": {},
             "tool_results": [],
             "discovered_vulnerabilities": [],
-            "exploitation_results": {},
             "verified_vulnerabilities": [],
+            "exploitation_results": {},
             "report_path": "",
             "report_findings": {},
             "start_time": datetime.utcnow().isoformat(),
             "stage": "initializing",
-            "error": ""
+            "error": "",
+            "models_used": {},
         }
-        
-        logger.info(f"🚀 Starting scan {scan_id} on {target}")
-        
-        # Execute workflow
+
+        logger.info(f"🚀 Launching multi-agent scan {scan_id} on {target}")
         result = await self.graph.ainvoke(initial_state)
-        
         return result
 
-# Global orchestrator instance
-_orchestrator: SecurityAgentOrchestrator = None
+
+# Singleton instance
+_orchestrator: SecurityAgentOrchestrator | None = None
 
 def get_orchestrator(db_session=None) -> SecurityAgentOrchestrator:
-    """Get or create orchestrator"""
     global _orchestrator
     if _orchestrator is None:
         _orchestrator = SecurityAgentOrchestrator(db_session)

@@ -26,8 +26,10 @@ class OllamaChatRequest(BaseModel):
 
 
 class LlmConfigUpdate(BaseModel):
+    active_provider: str | None = Field(default=None, max_length=50)
     context_window: int | None = Field(default=None, ge=4096, le=131072)
     max_tokens: int | None = Field(default=None, ge=512, le=32768)
+    gemini_model: str | None = Field(default=None, max_length=100)
     claude_api_key: str | None = Field(default=None, max_length=500)
     gemini_api_key: str | None = Field(default=None, max_length=500)
     openai_api_key: str | None = Field(default=None, max_length=500)
@@ -54,12 +56,20 @@ async def get_llm_config() -> dict:
 
 @router.put("/llm")
 async def update_llm_config(request: LlmConfigUpdate) -> dict:
+    updates: dict = {}
+    if request.active_provider:
+        settings.ACTIVE_LLM = request.active_provider
+        updates["active_provider"] = request.active_provider
+    if request.gemini_model:
+        settings.GEMINI_MODEL = request.gemini_model
+        updates["gemini_model"] = request.gemini_model
     if request.context_window is not None:
         settings.CONTEXT_WINDOW = request.context_window
-        update_runtime_config(context_window=request.context_window)
+        updates["context_window"] = request.context_window
     if request.max_tokens is not None:
         settings.MAX_TOKENS = request.max_tokens
-        update_runtime_config(max_tokens=request.max_tokens)
+        updates["max_tokens"] = request.max_tokens
+
     for field, setting_name in {
         "claude_api_key": "CLAUDE_API_KEY",
         "gemini_api_key": "GEMINI_API_KEY",
@@ -69,7 +79,50 @@ async def update_llm_config(request: LlmConfigUpdate) -> dict:
         value = getattr(request, field)
         if value:
             setattr(settings, setting_name, value)
+            updates[field] = value
+
+    if updates:
+        update_runtime_config(**updates)
+
     return await get_llm_config()
+
+
+class GeminiTestRequest(BaseModel):
+    api_key: str | None = None
+    model: str | None = "gemini-2.0-flash"
+
+
+@router.post("/gemini/test")
+async def test_gemini_connection(request: GeminiTestRequest) -> dict:
+    """Test Google Gemini API key by generating a short ping message."""
+    api_key = request.api_key or settings.GEMINI_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Gemini API key is not provided or configured.")
+
+    model_name = request.model or settings.GEMINI_MODEL or "gemini-2.0-flash"
+
+    # Test via SDK or REST
+    try:
+        import httpx
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        payload = {"contents": [{"parts": [{"text": "Hello, respond with: OK"}]}]}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                return {
+                    "status": "connected",
+                    "provider": "gemini",
+                    "model": model_name,
+                    "message": "Google Gemini API key verified successfully!",
+                }
+            else:
+                err_body = resp.json().get("error", {}).get("message", resp.text[:200])
+                raise HTTPException(status_code=400, detail=f"Google Gemini rejected request: {err_body}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to Google Gemini: {e}")
+
 
 
 @router.post("/ollama/test")

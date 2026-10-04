@@ -6,6 +6,7 @@ import {
   Bot,
   ChevronRight,
   CircleUserRound,
+  Download,
   FileText,
   LayoutDashboard,
   Menu,
@@ -200,7 +201,98 @@ function NewScanForm({ onStarted }: { onStarted: (id: string) => void }) {
   return <form className="panel scan-form" onSubmit={submit}><div className="panel-heading"><div><p className="eyebrow">NEW MISSION</p><h2>Configure target</h2></div><Radio size={18} /></div><label>Target<input value={target} onChange={(event) => setTarget(event.target.value)} placeholder="example.com or 10.0.0.1" required /></label><label>Path <span className="label-hint">optional</span><input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="/health or /admin" /></label><div className="form-pair"><label>Mode<select value={mode} onChange={(event) => setMode(event.target.value as SecurityMode)}><option value="safe">Safe</option><option value="guarded">Guarded</option><option value="full_access">Full access</option><option value="human_review">Human review</option></select></label><label>Model<select value={provider} onChange={(event) => setProvider(event.target.value)}><option value="ollama">Ollama local</option><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="gemini">Gemini</option><option value="nvidia">Nvidia</option></select></label></div>{error && <p className="form-error">{error}</p>}<button className="primary-button full-button" disabled={loading}>{loading ? <><Activity size={16} className="spin" /> Starting</> : <><Play size={16} fill="currentColor" /> Start assessment</>}</button></form>
 }
 
-function ScanDetail({ scanId, status, results }: { scanId: string; status: ScanStatusResponse | null; results: ScanResults | null }) { const [token, setToken] = useState(''); const [message, setMessage] = useState(''); async function approve() { try { await approveScan(scanId, token); setMessage('Approval recorded. The scan is queued.'); } catch { setMessage('Approval failed.'); } } return <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">LIVE TELEMETRY</p><h2>{status?.target ?? 'Selected scan'}</h2></div><span className={`status-pill status-pill--${status?.status ?? 'pending'}`}>{status?.status ?? 'loading'}</span></div><div className="progress-line"><span style={{ width: `${status?.progress_percentage ?? 0}%` }} /></div><div className="detail-meta"><span>Stage <strong>{status?.stage ?? 'initializing'}</strong></span><span>Findings <strong>{results?.vulnerabilities.length ?? status?.vulnerabilities_found ?? 0}</strong></span><span>Progress <strong>{Math.round(status?.progress_percentage ?? 0)}%</strong></span></div>{status?.status === 'awaiting_review' && <div className="review-gate"><p>Human review is required before tools can run.</p><div><input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Reviewer token" /><button className="primary-button" type="button" onClick={approve} disabled={!token.trim()}>Approve</button></div><small>{message}</small></div>}{results && <div className="finding-list">{results.vulnerabilities.map((vulnerability) => <div className="finding-row" key={vulnerability.id}><span className={`severity-label severity-label--${vulnerability.severity}`}>{vulnerability.severity}</span><div><strong>{vulnerability.title}</strong><p>{vulnerability.description}</p></div></div>)}</div>}</section> }
+function ScanDetail({ scanId, status, results }: { scanId: string; status: ScanStatusResponse | null; results: ScanResults | null }) {
+  const [token, setToken] = useState('')
+  const [message, setMessage] = useState('')
+  const baseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+
+  async function approve() {
+    try {
+      await approveScan(scanId, token)
+      setMessage('Approval recorded. The scan is queued.')
+    } catch {
+      setMessage('Approval failed.')
+    }
+  }
+
+  return (
+    <section className="panel detail-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">LIVE TELEMETRY</p>
+          <h2>{status?.target ?? 'Selected scan'}</h2>
+        </div>
+        <span className={`status-pill status-pill--${status?.status ?? 'pending'}`}>{status?.status ?? 'loading'}</span>
+      </div>
+      <div className="progress-line">
+        <span style={{ width: `${status?.progress_percentage ?? 0}%` }} />
+      </div>
+      <div className="detail-meta">
+        <span>Stage <strong>{status?.stage ?? 'initializing'}</strong></span>
+        <span>Findings <strong>{results?.vulnerabilities.length ?? status?.vulnerabilities_found ?? 0}</strong></span>
+        <span>Progress <strong>{Math.round(status?.progress_percentage ?? 0)}%</strong></span>
+      </div>
+
+      {status?.status === 'completed' && (
+        <div style={{
+          margin: '14px 0',
+          padding: '12px 16px',
+          background: 'rgba(56, 189, 248, 0.08)',
+          border: '1px solid rgba(56, 189, 248, 0.25)',
+          borderRadius: '8px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: '10px'
+        }}>
+          <div>
+            <strong style={{ color: '#38bdf8' }}>📄 PDF Assessment Report Ready</strong>
+            <p style={{ margin: '2px 0 0', fontSize: '13px', color: '#94a3b8' }}>
+              The report was compiled and saved to <code>/reports</code>.
+            </p>
+          </div>
+          <a
+            className="primary-button"
+            href={`${baseUrl}/api/reports/scan/${scanId}/download`}
+            target="_blank"
+            rel="noreferrer"
+            style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '7px', padding: '8px 14px' }}
+          >
+            <Download size={15} /> Download PDF Report
+          </a>
+        </div>
+      )}
+
+      {status?.status === 'awaiting_review' && (
+        <div className="review-gate">
+          <p>Human review is required before tools can run.</p>
+          <div>
+            <input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Reviewer token" />
+            <button className="primary-button" type="button" onClick={approve} disabled={!token.trim()}>
+              Approve
+            </button>
+          </div>
+          <small>{message}</small>
+        </div>
+      )}
+
+      {results && (
+        <div className="finding-list">
+          {results.vulnerabilities.map((vulnerability) => (
+            <div className="finding-row" key={vulnerability.id}>
+              <span className={`severity-label severity-label--${vulnerability.severity}`}>{vulnerability.severity}</span>
+              <div>
+                <strong>{vulnerability.title}</strong>
+                <p>{vulnerability.description}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
 
 function FindingsView({ scans, results, onSelect }: { scans: Scan[]; results: ScanResults | null; onSelect: (id: string) => void }) { return <div className="view-stack"><section className="hero-row compact"><div><p className="eyebrow">EVIDENCE INDEX</p><h1>Verified findings</h1><p className="muted-copy">Select a completed scan to inspect the evidence and risk picture.</p></div></section><div className="panel"><div className="panel-heading"><h2>Scan sources</h2><span className="count-badge">{scans.length}</span></div>{scans.map((scan) => <ScanRow key={scan.scan_id} scan={scan} onClick={() => onSelect(scan.scan_id)} />)}{results && <div className="finding-summary"><p className="eyebrow">SELECTED RESULT</p><h2>{results.target}</h2><p className="muted-copy">Risk score: <strong>{results.risk_score.toFixed(1)}</strong></p></div>}</div></div> }
 function ReportsView({ scans }: { scans: Scan[] }) { return <div className="view-stack"><section className="hero-row compact"><div><p className="eyebrow">OUTPUT STUDIO</p><h1>Reports</h1><p className="muted-copy">Generated assessment artifacts will appear here.</p></div></section><div className="panel empty-large"><FileText size={27} /><h2>No reports generated</h2><p>Complete a scan to make a report available. {scans.length} scan{scans.length === 1 ? '' : 's'} in the archive.</p></div></div> }

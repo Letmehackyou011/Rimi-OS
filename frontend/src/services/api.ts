@@ -42,6 +42,16 @@ export async function scheduleScan(scanId: string, runAt: string) {
   return data
 }
 
+export async function runExploitation(scanId: string, options?: { mode?: string; llm_provider?: string; llm_model?: string }) {
+  const { data } = await api.post(`/api/scan/${scanId}/exploit`, options ?? {})
+  return data as { scan_id: string; status: string; verified_count: number; total_findings: number; message: string }
+}
+
+export async function testGemini(apiKey?: string, model?: string) {
+  const { data } = await api.post('/api/config/gemini/test', { api_key: apiKey, model })
+  return data as { status: string; provider: string; model: string; message: string }
+}
+
 export async function listReports() {
   const { data } = await api.get('/api/reports/')
   return data as { reports: Array<{ id: string; scan_id: string; title: string; generated_at: string; download: string }>; total: number }
@@ -73,6 +83,8 @@ export async function getLlmConfig(): Promise<LlmConfig> {
 }
 
 export async function updateLlmConfig(input: {
+  active_provider?: string
+  gemini_model?: string
   context_window?: number
   max_tokens?: number
   claude_api_key?: string
