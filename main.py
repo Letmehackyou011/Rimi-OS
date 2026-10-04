@@ -66,7 +66,8 @@ async def root():
     return {
         "message": "AI Security Research OS API",
         "docs": "/docs",
-        "status": "running"
+        "status": "running",
+        "status code": 200
     }
 
 # Include Routers
