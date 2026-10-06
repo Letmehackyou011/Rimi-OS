@@ -6,3 +6,4 @@ __pycache__/
 .vscode/
 myenv/
 "@ | Add-Content .gitignorenode_modules/
+node_modules/
