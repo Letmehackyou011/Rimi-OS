@@ -5,4 +5,5 @@ __pycache__/
 *.pyc
 .vscode/
 myenv/
-"@ | Add-Content .gitignorenode_modules/
+"@ | Add-Content .gitignore
+node_modules/
