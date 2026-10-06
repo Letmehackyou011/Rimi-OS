@@ -19,6 +19,8 @@ ollama>=0.0.48
 
 # Database
 sqlalchemy==2.0.23
+asyncpg>=0.29,<1
+aiosqlite>=0.19,<1
 psycopg2-binary==2.9.9
 alembic==1.12.1
 
