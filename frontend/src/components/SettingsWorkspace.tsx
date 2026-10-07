@@ -19,7 +19,9 @@ export default function SettingsWorkspace({ config }: { config: LlmConfig | null
     if (!config) return
     setActiveProvider(config.active_provider || 'ollama')
     try {
-      const endpoint = new URL(config.ollama_endpoint)
+      const endpoint = config.ollama_endpoint 
+     ? new URL(config.ollama_endpoint) 
+     : { hostname: '127.0.0.1', port: '11434' }
       setHost(endpoint.hostname)
       setPort(Number(endpoint.port || 11434))
     } catch {
@@ -27,7 +29,7 @@ export default function SettingsWorkspace({ config }: { config: LlmConfig | null
       setPort(11434)
     }
     setModel(config.ollama_model || '')
-    setGeminiModel(config.gemini_model || 'gemini-2.0-flash')
+    setGeminiModel(config.gemini_model || 'gemini-3-flash-preview')
     setContextWindow(config.context_window || 32768)
     setMaxTokens(config.max_tokens || 8000)
   }, [config])
@@ -143,7 +145,8 @@ export default function SettingsWorkspace({ config }: { config: LlmConfig | null
                 onChange={(e) => setGeminiModel(e.target.value)}
                 style={{ width: '100%', marginTop: '6px' }}
               >
-                <option value="gemini-2.0-flash">gemini-2.0-flash (Recommended)</option>
+                <option value="gemini-3-flash-preview">gemini-3-flash-preview (Preview)</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
                 <option value="gemini-1.5-flash">gemini-1.5-flash</option>
                 <option value="gemini-1.5-pro">gemini-1.5-pro</option>
               </select>

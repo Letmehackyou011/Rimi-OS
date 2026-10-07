@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 # Format: List of (provider, model_name)
 DEFAULT_AGENT_CHAINS: Dict[str, List[Tuple[str, str]]] = {
     "reconnaissance": [
+        ("gemini", "gemini-3-flash-preview"),
         ("gemini", "gemini-2.0-flash"),
+        ("gemini", "gemini-3.5-flash"),
         ("ollama", "mistral"),
         ("ollama", "llama3"),
         ("openai", "gpt-4o-mini"),
@@ -26,6 +28,7 @@ DEFAULT_AGENT_CHAINS: Dict[str, List[Tuple[str, str]]] = {
     "vulnerability_analysis": [
         ("claude", "claude-3-5-sonnet-20241022"),
         ("gemini", "gemini-2.0-flash"),
+        ("gemini", "gemini-3-flash-preview"),
         ("ollama", "mistral"),
         ("openai", "gpt-4o"),
     ],
@@ -33,10 +36,11 @@ DEFAULT_AGENT_CHAINS: Dict[str, List[Tuple[str, str]]] = {
         ("openai", "gpt-4o"),
         ("claude", "claude-3-5-sonnet-20241022"),
         ("gemini", "gemini-2.0-flash"),
+        ("gemini", "gemini-3-flash-preview"),
         ("ollama", "mistral"),
     ],
     "reporting": [
-        ("gemini", "gemini-2.0-flash"),
+        ("gemini", "gemini-3-flash-preview"),
         ("claude", "claude-3-5-sonnet-20241022"),
         ("ollama", "mistral"),
         ("openai", "gpt-4o-mini"),
